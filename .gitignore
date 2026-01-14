@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# SQLite DB
+*.db
+*.sqlite3
+
+# Streamlit cache/config
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
