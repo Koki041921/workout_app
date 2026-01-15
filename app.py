@@ -1,12 +1,32 @@
 # app.py
-import sqlite3
-from datetime import date, datetime, timedelta
+from __future__ import annotations
 
+from datetime import date, timedelta
 import pandas as pd
 import streamlit as st  # type: ignore
 
-DB_PATH = "workout.db"
+from db import (  # type: ignore
+    init_db,
+    insert_entry,
+    delete_entry,
+    update_entry,
+    fetch_by_date,
+    fetch_range,
+    fetch_last_for_exercise,
+    fetch_last_day_entries_for_exercise,
+)
 
+from services import (  # type: ignore
+    rows_to_df,
+    volume_total,
+    today_grouped,
+    add_body_part,
+    volume_by_body_part,
+)
+
+# ====================
+# Settings / Constants
+# ====================
 EXERCISES_DEFAULT = [
     "ベンチプレス",
     "ダンベルプレス",
@@ -18,137 +38,90 @@ EXERCISES_DEFAULT = [
     "サイドプレス",
 ]
 
+# 種目 → 部位（まずは主働筋だけに寄せる）
+EXERCISE_TO_BODY_PART = {
+    "ベンチプレス": "胸",
+    "ダンベルプレス": "胸",
+    "インクラインダンベルプレス": "胸",
+    "懸垂": "背中",
+    "ラットプルダウン": "背中",
+    "ベントオーバーロウ": "背中",
+    "ショルダープレス": "肩",
+    "サイドプレス": "肩",
+}
+
+BODY_PARTS = ["胸", "背中", "肩", "脚", "腕", "体幹"]  # 将来拡張用
 
 # ====================
-# DB
+# Helpers
 # ====================
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
-def init_db():
-    with get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS workout_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                exercise TEXT NOT NULL,
-                weight REAL NOT NULL,
-                reps INTEGER NOT NULL,
-                sets INTEGER NOT NULL,
-                volume REAL NOT NULL,
-                note TEXT,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-        conn.commit()
+def ratio_vs_last(actual: int, last_actual: int) -> float | None:
+    """先週比率（今週/先週）。先週0は None"""
+    if last_actual <= 0:
+        return None
+    return actual / last_actual
 
 
-def insert_entry(d, exercise, weight, reps, sets, note):
-    volume = float(weight) * int(reps) * int(sets)
-    now = datetime.now().isoformat(timespec="seconds")
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO workout_entries(date, exercise, weight, reps, sets, volume, note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (d, exercise, weight, reps, sets, volume, note, now),
-        )
-        conn.commit()
+def week_range_monday(d: date) -> tuple[date, date]:
+    """今週（月〜日）"""
+    start = d - timedelta(days=d.weekday())  # Monday
+    end = start + timedelta(days=6)
+    return start, end
 
 
-def delete_entry(entry_id: int):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM workout_entries WHERE id = ?", (entry_id,))
-        conn.commit()
+@st.cache_data(show_spinner=False)
+def week_part_volumes(start_iso: str, end_iso: str) -> dict[str, int]:
+    """指定期間の部位別ボリュームを dict で返す"""
+    rows = fetch_range(start_iso, end_iso)
+    df = rows_to_df(rows)
+    if df.empty:
+        return {}
+    dfp = add_body_part(df, EXERCISE_TO_BODY_PART)
+    by_part = volume_by_body_part(dfp)
+    return {str(r["body_part"]): int(r["volume"]) for _, r in by_part.iterrows()}
 
 
-def fetch_by_date(d):
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
-            SELECT id, date, exercise, weight, reps, sets, volume, note, created_at
-            FROM workout_entries
-            WHERE date = ?
-            ORDER BY created_at DESC
-            """,
-            (d,),
-        )
-        return cur.fetchall()
-
-
-def fetch_week(start_date, end_date):
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
-            SELECT id, date, exercise, weight, reps, sets, volume, note, created_at
-            FROM workout_entries
-            WHERE date BETWEEN ? AND ?
-            ORDER BY date DESC, created_at DESC
-            """,
-            (start_date, end_date),
-        )
-        return cur.fetchall()
-
-
-def fetch_last_for_exercise(exercise: str):
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
-            SELECT date, weight, reps, sets, note
-            FROM workout_entries
-            WHERE exercise = ?
-            ORDER BY date DESC, created_at DESC
-            LIMIT 1
-            """,
-            (exercise,),
-        )
-        return cur.fetchone()
-
-
-def fetch_last_day_entries_for_exercise(exercise: str):
-    """
-    その種目について、直近の「日付」を特定し、
-    その日の同種目の全行（= セット構成）を返す
-    """
-    with get_conn() as conn:
-        cur = conn.execute(
-            "SELECT date FROM workout_entries WHERE exercise = ? ORDER BY date DESC LIMIT 1",
-            (exercise,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return []
-
-        last_date = row[0]
-
-        cur2 = conn.execute(
-            """
-            SELECT weight, reps, sets, note
-            FROM workout_entries
-            WHERE exercise = ? AND date = ?
-            ORDER BY created_at ASC
-            """,
-            (exercise, last_date),
-        )
-        rows = cur2.fetchall()
-
-    return [
-        {"date": last_date, "weight": r[0], "reps": r[1], "sets": r[2], "note": r[3] or ""}
-        for r in rows
-    ]
+def get_part_volume(vol_map: dict[str, int], part: str) -> int:
+    return int(vol_map.get(part, 0))
 
 
 # ====================
-# App
+# App init
 # ====================
 init_db()
 
 st.set_page_config(page_title="筋トレボリューム管理", layout="wide")
 st.title("筋トレボリューム管理（PC版MVP）")
+
+# ====================
+# Sidebar: Visible parts & weekly goals
+# ====================
+st.sidebar.header("表示する部位")
+if "visible_parts" not in st.session_state:
+    st.session_state.visible_parts = BODY_PARTS.copy()
+
+visible_parts = st.sidebar.multiselect(
+    "ダッシュボードに表示する部位",
+    options=BODY_PARTS,
+    default=st.session_state.visible_parts,
+)
+st.session_state.visible_parts = visible_parts
+
+if not visible_parts:
+    st.sidebar.warning("最低1つは選択してください（表示が空になります）")
+
+st.sidebar.divider()
+
+
+# 週レンジ（今週・先週）を一度決める
+today_d = date.today()
+this_ws, this_we = week_range_monday(today_d)
+last_ws, last_we = this_ws - timedelta(days=7), this_we - timedelta(days=7)
+
+this_week_vols = week_part_volumes(this_ws.isoformat(), this_we.isoformat())
+last_week_vols = week_part_volumes(last_ws.isoformat(), last_we.isoformat())
 
 tabs = st.tabs(["入力", "本日の記録", "週集計"])
 
@@ -156,111 +129,51 @@ tabs = st.tabs(["入力", "本日の記録", "週集計"])
 # 入力タブ
 # --------------------
 with tabs[0]:
-    st.subheader("入力（セットビルダー）")
+    st.subheader("記録（この日のワークアウト）")
 
-    # 1) 種目選択
+    # 1) 日付・種目
     workout_date = st.date_input("日付", value=date.today(), key="input_date")
     exercise = st.selectbox("種目", EXERCISES_DEFAULT, key="input_exercise")
 
-    # 2) セットビルダーの状態（種目ごとに一時保持）
-    draft_key = f"draft_sets::{workout_date.isoformat()}::{exercise}"
-    if draft_key not in st.session_state:
-        st.session_state[draft_key] = []  # list[dict]
+    # ---- 進捗（先週比）：選択中種目の部位
+    selected_part = EXERCISE_TO_BODY_PART.get(exercise, "未分類")
+    current_actual = get_part_volume(this_week_vols, selected_part)
+    current_last = get_part_volume(last_week_vols, selected_part)
+    r_now = ratio_vs_last(current_actual, current_last)
 
-    draft_sets = st.session_state[draft_key]
+    box_l, box_r = st.columns([1.2, 3.8])
+    with box_l:
+        st.write("#### この種目の部位")
+        st.info(selected_part)
 
-    # 3) 前回セット（小さく表示）＋丸ごとコピー
+    with box_r:
+        st.write(f"#### 今週の進捗（先週比）（{this_ws.isoformat()}〜{this_we.isoformat()}）")
+        c1, c2, c3 = st.columns([1.4, 1.4, 3.2])
+        with c1:
+            st.metric("今週", f"{current_actual}")
+        with c2:
+            st.metric("先週", f"{current_last}")
+        with c3:
+            if r_now is None:
+                st.caption("先週が0なので先週比バーは非表示")
+            else:
+                st.progress(min(r_now, 1.0))
+                st.caption(f"先週比 {r_now*100:.0f}%（先週=100%基準）")
+
+    st.divider()
+
+    # 2) 前回セット（参考・コピー用）
     last_sets = fetch_last_day_entries_for_exercise(exercise)
     last = fetch_last_for_exercise(exercise)
 
     if last_sets:
         last_date = last_sets[0]["date"]
-        with st.expander("前回セット（参考）", expanded=False):
+        with st.expander("前回のセット（参考）", expanded=False):
             lines = [f"{s['weight']}kg×{s['reps']}×{s['sets']}" for s in last_sets]
             st.caption(f"{last_date}： " + " / ".join(lines))
 
-            if st.button("前回セットを全部コピー", key=f"copy_last_{draft_key}"):
-                st.session_state[draft_key] = [
-                    {
-                        "weight": float(s["weight"]),
-                        "reps": int(s["reps"]),
-                        "sets": int(s["sets"]),
-                        "note": s["note"],
-                    }
-                    for s in last_sets
-                ]
-                st.success("コピーしました。")
-                st.rerun()
-    else:
-        st.caption("この種目の過去記録がないので、コピーはできません。")
-
-    # 4) 候補（プリセット）
-    base_w = float(last[1]) if last else 60.0
-    weight_options = [max(0, base_w + 2.5 * i) for i in [-3, -2, -1, 0, 1, 2, 3]]
-    reps_options = [5, 6, 8, 10, 12, 15]
-    sets_options = [1, 2, 3, 4, 5]
-
-    st.write("### セットを追加（選んでポン）")
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        weight = st.selectbox("重量(kg)", weight_options, index=3, key="sb_weight")
-        custom_weight = st.text_input("任意重量（空でOK）", value="", key="sb_custom_weight")
-
-    with c2:
-        reps = st.selectbox("回数", reps_options, index=3, key="sb_reps")
-
-    with c3:
-        sets = st.selectbox("セット数", sets_options, index=2, key="sb_sets")
-
-    note = st.text_input("メモ（任意）", value="", key="sb_note")
-
-    # 任意重量が入ってたら優先
-    try:
-        w_final = float(custom_weight) if custom_weight.strip() != "" else float(weight)
-    except ValueError:
-        w_final = float(weight)
-
-    if st.button("このセット構成を追加"):
-        if w_final <= 0 or reps <= 0 or sets <= 0:
-            st.error("重量・回数・セット数は1以上で入力してください。")
-        else:
-            draft_sets.append({"weight": w_final, "reps": int(reps), "sets": int(sets), "note": note})
-            st.session_state[draft_key] = draft_sets
-            st.success("追加しました。")
-
-    st.divider()
-
-    # 5) 追加済みのセット一覧（この種目）
-    st.write("### 追加済みセット（この種目）")
-    if not draft_sets:
-        st.info("まだ追加されていません。上で追加してください。")
-    else:
-        df = pd.DataFrame(draft_sets)
-        df["volume"] = (df["weight"] * df["reps"] * df["sets"]).round(0).astype(int)
-
-        st.dataframe(df[["weight", "reps", "sets", "volume", "note"]], use_container_width=True)
-
-        ex_total = int(df["volume"].sum())
-        st.metric("この種目の合計ボリューム", f"{ex_total}")
-
-        c1, c2, c3 = st.columns([1, 1, 2])
-
-        with c1:
-            if st.button("直前の追加を取り消す"):
-                if draft_sets:
-                    draft_sets.pop()
-                    st.session_state[draft_key] = draft_sets
-                st.rerun()
-
-        with c2:
-            if st.button("この種目の追加を全クリア"):
-                st.session_state[draft_key] = []
-                st.rerun()
-
-        with c3:
-            if st.button("この種目をまとめて保存"):
-                for s in draft_sets:
+            if st.button("前回セットを追加", key="btn_copy_last"):
+                for s in last_sets:
                     insert_entry(
                         workout_date.isoformat(),
                         exercise,
@@ -269,46 +182,189 @@ with tabs[0]:
                         s["sets"],
                         s.get("note", ""),
                     )
-                st.success("保存しました。")
-                st.session_state[draft_key] = []
+                st.success("前回セットを追加しました。")
+                st.cache_data.clear()
                 st.rerun()
 
+    # 3) セット入力（即DB反映）
+    base_w = float(last[1]) if last else 60.0
+    weight_options = [max(0, base_w + 2.5 * i) for i in [-3, -2, -1, 0, 1, 2, 3]]
+
+    st.write("### セットを追加")
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        weight = st.selectbox("重量(kg)", weight_options, index=3)
+        custom_weight = st.text_input("任意重量（空でOK）")
+
+    with c2:
+        reps = st.number_input("回数", min_value=1, value=10)
+
+    with c3:
+        sets = st.number_input("セット数", min_value=1, value=3)
+
+    note = st.text_input("メモ（任意）")
+
+    # ---- Phase4相当：このセットを入れたら先週比がどう変わるか（予測）
+    try:
+        w_final_preview = float(custom_weight) if custom_weight.strip() else float(weight)
+    except ValueError:
+        w_final_preview = float(weight)
+
+    this_volume_preview = int(round(w_final_preview * int(reps) * int(sets), 0))
+    predicted_actual = current_actual + this_volume_preview
+    r_pred = ratio_vs_last(predicted_actual, current_last)
+
+    if current_last <= 0:
+        st.caption(f"このセットの追加ボリューム：+{this_volume_preview}（先週が0のため先週比は計算不可）")
+    else:
+        st.caption(
+            f"このセット（+{this_volume_preview}）を入れると：先週比 {r_pred*100:.0f}%（今週 {predicted_actual} / 先週 {current_last}）"
+        )
+
+    if st.button("このセットを記録"):
+        insert_entry(
+            workout_date.isoformat(),
+            exercise,
+            float(w_final_preview),
+            int(reps),
+            int(sets),
+            note,
+        )
+        st.success("記録しました。")
+        st.cache_data.clear()
+        st.rerun()
+
+    st.divider()
+
+    # 4) この日の記録（DB）を常時表示・編集
+    st.subheader("この日の記録（編集・削除）")
+
+    rows_day = fetch_by_date(workout_date.isoformat())
+    if not rows_day:
+        st.info("この日の記録はまだありません。")
+    else:
+        df_day = rows_to_df(rows_day)
+
+        for ex2, g in df_day.groupby("exercise", sort=False):
+            ex_total = float(g["volume"].sum())
+            with st.expander(f"{ex2}（合計 {ex_total:.0f}）", expanded=False):
+                for _, r in g.iterrows():
+                    entry_id = int(r["id"])
+                    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 2.5, 1.2])
+
+                    with c1:
+                        new_w = st.number_input(
+                            "kg",
+                            value=float(r["weight"]),
+                            step=2.5,
+                            key=f"edit_w_{entry_id}",
+                        )
+                    with c2:
+                        new_reps = st.number_input(
+                            "reps",
+                            value=int(r["reps"]),
+                            step=1,
+                            key=f"edit_r_{entry_id}",
+                        )
+                    with c3:
+                        new_sets = st.number_input(
+                            "sets",
+                            value=int(r["sets"]),
+                            step=1,
+                            key=f"edit_s_{entry_id}",
+                        )
+                    with c4:
+                        new_note = st.text_input(
+                            "note",
+                            value=str(r["note"] or ""),
+                            key=f"edit_n_{entry_id}",
+                        )
+                    with c5:
+                        if st.button("更新", key=f"btn_up_{entry_id}"):
+                            update_entry(entry_id, float(new_w), int(new_reps), int(new_sets), str(new_note))
+                            st.success("更新しました。")
+                            st.cache_data.clear()
+                            st.rerun()
+
+                        if st.button("削除", key=f"btn_del_{entry_id}"):
+                            delete_entry(entry_id)
+                            st.success("削除しました。")
+                            st.cache_data.clear()
+                            st.rerun()
+
 # --------------------
-# 本日の記録タブ
+# 記録タブ（旧：本日の記録）
 # --------------------
 with tabs[1]:
-    st.subheader("本日の記録")
+    st.subheader("記録")
 
-    today = date.today().isoformat()
-    rows = fetch_by_date(today)
+    # ---- 今週の進捗（部位別）：先週比バー
+    st.write(f"### 今週の進捗（先週比）（{this_ws.isoformat()}〜{this_we.isoformat()}）")
+
+    show_parts = visible_parts if visible_parts else BODY_PARTS
+    if not show_parts:
+        st.info("サイドバーで表示する部位を選択してください。")
+    else:
+        for p in show_parts:
+            actual = get_part_volume(this_week_vols, p)
+            last_actual = get_part_volume(last_week_vols, p)
+            r = ratio_vs_last(actual, last_actual)
+
+            c1, c2, c3 = st.columns([1.4, 1.4, 3.2])
+            with c1:
+                st.metric(p, f"{actual}")
+            with c2:
+                st.metric("先週", f"{last_actual}")
+            with c3:
+                if r is None:
+                    st.caption("先週が0なので先週比バーは非表示")
+                else:
+                    st.progress(min(r, 1.0))
+                    st.caption(f"先週比 {r*100:.0f}%（先週=100%基準）")
+
+        st.divider()
+
+    # ---- 本日の記録（今日）
+    st.write("### 本日の記録")
+
+    today_iso = date.today().isoformat()
+    rows = fetch_by_date(today_iso)
 
     if not rows:
         st.info("本日の記録はまだありません。")
     else:
-        df = pd.DataFrame(
-            rows,
-            columns=["id", "date", "exercise", "weight", "reps", "sets", "volume", "note", "created_at"],
-        )
+        df_today = rows_to_df(rows)
 
-        st.metric("本日の総ボリューム", f"{df['volume'].sum():.0f}")
+        # 1) 総ボリューム
+        st.metric("本日の総ボリューム", f"{volume_total(df_today):.0f}")
 
-        st.write("### 種目別")
-        for ex, g in df.groupby("exercise", sort=False):
-            ex_total = g["volume"].sum()
-            with st.expander(f"{ex}（合計 {ex_total:.0f}）", expanded=True):
-                show = g[["id", "weight", "reps", "sets", "volume", "note"]].copy()
-                show["volume"] = show["volume"].round(0).astype(int)
-                st.dataframe(show, use_container_width=True)
+        # 2) 部位別ボリューム（表示部位のみ）
+        dfp_today = add_body_part(df_today, EXERCISE_TO_BODY_PART)
+        part_today = volume_by_body_part(dfp_today)
 
-        st.write("### 削除")
-        delete_id = st.number_input("削除したいID", min_value=0, value=0, step=1, key="today_delete_id")
-        if st.button("このIDを削除（本日の記録から）"):
-            if delete_id <= 0:
-                st.error("IDを正しく入力してください。")
+        if not part_today.empty:
+            # 表示部位でフィルタ（visible_parts未指定ならBODY_PARTS優先）
+            filter_parts = show_parts if show_parts else BODY_PARTS
+            part_today_view = part_today[part_today["body_part"].isin(filter_parts)].copy()
+
+            if part_today_view.empty:
+                st.caption("本日は表示対象部位の記録がありません（未分類のみ等）。")
             else:
-                delete_entry(int(delete_id))
-                st.success("削除しました。")
-                st.rerun()
+                st.write("#### 本日の部位別ボリューム")
+                st.dataframe(part_today_view, use_container_width=True)
+        else:
+            st.caption("本日の部位別ボリュームはありません。")
+
+        st.divider()
+
+        # 3) 種目別（詳細）
+        st.write("### 種目別")
+        grouped = today_grouped(df_today)
+        for ex, show_df, ex_total in grouped:
+            with st.expander(f"{ex}（合計 {ex_total:.0f}）", expanded=False):
+                st.dataframe(show_df, use_container_width=True)
+
 
 # --------------------
 # 週集計タブ
@@ -318,55 +374,83 @@ with tabs[2]:
 
     start_end = st.date_input(
         "期間を選ぶ（開始日〜終了日）",
-        value=(date.today() - timedelta(days=6), date.today()),
-        key="range_weekly",
+        value=(this_ws, this_we),
+        key="range_pick",
     )
 
-    if isinstance(start_end, tuple) and len(start_end) == 2:
+    if not isinstance(start_end, tuple) or len(start_end) != 2:
+        st.info("開始日と終了日を選んでください。")
+    else:
         start_date, end_date = start_end
-    else:
-        start_date, end_date = start_end, start_end
+        if start_date > end_date:
+            st.error("開始日が終了日より後になっています。")
+        else:
+            rows_range = fetch_range(start_date.isoformat(), end_date.isoformat())
+            df_range = rows_to_df(rows_range)
 
-    if start_date > end_date:
-        start_date, end_date = end_date, start_date
+            if df_range.empty:
+                st.info("この期間の記録はありません。")
+            else:
+                all_days = pd.date_range(start_date, end_date, freq="D") \
+                    .strftime("%Y-%m-%d").tolist()
 
-    start = start_date.isoformat()
-    end = end_date.isoformat()
+                view_tabs = st.tabs(["総（種目）", "部位"])
 
-    rows = fetch_week(start, end)
+                # ---- 総（種目） ----
+                with view_tabs[0]:
+                    st.write("### 日別ボリューム")
+                    daily = (
+                        df_range.groupby("date", as_index=False)["volume"]
+                        .sum()
+                        .sort_values("date")
+                        .copy()
+                    )
+                    daily_full = pd.DataFrame({"date": all_days}) \
+                        .merge(daily, on="date", how="left")
+                    daily_full["volume"] = daily_full["volume"].fillna(0).round(0).astype(int)
+                    st.bar_chart(daily_full.set_index("date")[["volume"]])
 
-    if not rows:
-        st.info(f"{start} 〜 {end} の記録はありません。")
-    else:
-        df = pd.DataFrame(
-            rows,
-            columns=["id", "date", "exercise", "weight", "reps", "sets", "volume", "note", "created_at"],
-        )
+                    st.write("### 種目別ランキング（期間合計）")
+                    by_ex = (
+                        df_range.groupby("exercise", as_index=False)["volume"]
+                        .sum()
+                        .sort_values("volume", ascending=False)
+                        .copy()
+                    )
+                    by_ex["volume"] = by_ex["volume"].round(0).astype(int)
+                    st.dataframe(by_ex, use_container_width=True)
 
-        daily = df.groupby("date", as_index=False)["volume"].sum().sort_values("date")
-        all_days = pd.date_range(start=start, end=end, freq="D").strftime("%Y-%m-%d")
-        daily_full = (
-            pd.DataFrame({"date": all_days})
-            .merge(daily, on="date", how="left")
-            .fillna({"volume": 0})
-        )
+                # ---- 部位 ----
+                with view_tabs[1]:
+                    dfp = add_body_part(df_range, EXERCISE_TO_BODY_PART)
 
-        st.metric("期間合計ボリューム", f"{daily_full['volume'].sum():.0f}")
+                    is_this_week = (
+                        start_date == this_ws and end_date == this_we
+                    )
 
-        st.write("### 日別ボリューム（棒グラフ）")
-        st.bar_chart(daily_full.set_index("date")[["volume"]])
+                    st.write("### 目標差（％）")
+                    show_parts = visible_parts if visible_parts else BODY_PARTS
 
-        st.write("### 種目別ランキング（期間合計）")
-        by_ex = (
-            df.groupby("exercise", as_index=False)["volume"]
-            .sum()
-            .sort_values("volume", ascending=False)
-        )
-        by_ex["volume"] = by_ex["volume"].round(0).astype(int)
-        st.dataframe(by_ex, use_container_width=True)
+                    if show_parts:
+                        for p in show_parts:
+                            actual = get_part_volume(this_week_vols, p)
+                            last_actual = get_part_volume(last_week_vols, p)
+                            r = ratio_vs_last(actual, last_actual)
 
-        st.write("### 日別の詳細（選んだ日だけ）")
-        selected_date = st.selectbox("日付", daily_full["date"].tolist(), key="weekly_pick_date")
-        day_df = df[df["date"] == selected_date].copy()
-        day_df["volume"] = day_df["volume"].round(0).astype(int)
-        st.dataframe(day_df[["id", "exercise", "weight", "reps", "sets", "volume", "note"]], use_container_width=True)
+                            c1, c2, c3 = st.columns([1.4, 1.4, 3.2])
+                            with c1:
+                                st.metric(p, f"{actual}")
+                            with c2:
+                                st.metric("先週", f"{last_actual}")
+                            with c3:
+                                if r is None:
+                                    st.caption("先週が0なので先週比バーは非表示")
+                                else:
+                                    st.progress(min(r, 1.0))
+                                    st.caption(f"先週比 {r*100:.0f}%（先週=100%基準）")
+
+                    st.divider()
+
+                    st.write("### 部位別ボリューム（期間合計）")
+                    part_sum = volume_by_body_part(dfp)
+                    st.dataframe(part_sum, use_container_width=True)
