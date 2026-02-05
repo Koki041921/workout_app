@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import pandas as pd
+from collections import Counter
+from datetime import date as _date, timedelta
+from typing import Any, Dict, List, Tuple
+
 
 ENTRY_COLS = ["id", "date", "exercise", "weight", "reps", "sets", "volume", "note", "created_at"]
 
 
-def rows_to_df(rows: list[tuple], columns: list[str] = ENTRY_COLS) -> pd.DataFrame:
-    """DBのfetch結果（rows: list[tuple]）をDataFrameにする"""
+def rows_to_df(rows: list[Any], columns: list[str] = ENTRY_COLS) -> pd.DataFrame:
+    """DBのfetch結果（rows: list[sqlite3.Row] | list[dict]）をDataFrameにする"""
     if not rows:
         return pd.DataFrame(columns=columns)
-    return pd.DataFrame(rows, columns=columns)
+    return pd.DataFrame([dict(r) for r in rows], columns=columns)
 
 
 def volume_total(df: pd.DataFrame) -> float:
@@ -20,12 +24,12 @@ def volume_total(df: pd.DataFrame) -> float:
     return float(df["volume"].sum())
 
 
-def volume_by_exercise(df: pd.DataFrame) -> pd.DataFrame:
-    """種目別の合計ボリューム（降順）"""
+def _aggregate_volume_by_col(df: pd.DataFrame, col_name: str) -> pd.DataFrame:
+    """指定カラムでグループ化してボリューム合計を算出する共通関数"""
     if df.empty:
-        return pd.DataFrame(columns=["exercise", "volume"])
+        return pd.DataFrame(columns=[col_name, "volume"])
     out = (
-        df.groupby("exercise", as_index=False)["volume"]
+        df.groupby(col_name, as_index=False)["volume"]
         .sum()
         .sort_values("volume", ascending=False)
         .copy()
@@ -33,6 +37,9 @@ def volume_by_exercise(df: pd.DataFrame) -> pd.DataFrame:
     out["volume"] = out["volume"].round(0).astype(int)
     return out
 
+def volume_by_exercise(df: pd.DataFrame) -> pd.DataFrame:
+    """種目別の合計ボリューム（降順）"""
+    return _aggregate_volume_by_col(df, "exercise")
 
 def daily_volume(df_range: pd.DataFrame, all_days: list[str]) -> pd.DataFrame:
     """日別の合計ボリューム（0埋め）"""
@@ -89,13 +96,71 @@ def add_body_part(df: pd.DataFrame, exercise_to_body_part: dict[str, str]) -> pd
 
 def volume_by_body_part(df: pd.DataFrame) -> pd.DataFrame:
     """部位別の合計ボリューム（降順）"""
+    return _aggregate_volume_by_col(df, "body_part")
+
+def top_templates(rows, top_k: int = 3) -> list[dict]:
+    """
+    rows: Row or dict で
+      date, weight, reps, sets, note を持つ想定
+    """
+    if not rows:
+        return []
+
+    combos = []
+    for r in rows:
+        w = r["weight"]
+        reps = r["reps"]
+        sets = r["sets"]
+        combos.append((w, reps, sets))
+
+    counter = Counter(combos)
+
+    return [
+        {"weight": w, "reps": reps, "sets": sets, "freq": freq}
+        for (w, reps, sets), freq in counter.most_common(top_k)
+    ]
+
+def week_range_sunday(d: date) -> Tuple[str, str]:
+    """指定日を含む週（日〜土）の start, end を ISOフォーマット文字列で返す"""
+    start = d - timedelta(days=(d.weekday() + 1) % 7)
+    end = start + timedelta(days=6)
+    return start.isoformat(), end.isoformat()
+def weekly_volume_by_body_part(rows, exercise_to_body_part: dict[str, str]):
+    df = rows_to_df(rows)
     if df.empty:
-        return pd.DataFrame(columns=["body_part", "volume"])
-    out = (
-        df.groupby("body_part", as_index=False)["volume"]
-        .sum()
-        .sort_values("volume", ascending=False)
-        .copy()
-    )
-    out["volume"] = out["volume"].round(0).astype(int)
-    return out
+        return {}
+
+    df = add_body_part(df, exercise_to_body_part)
+    out = volume_by_body_part(df)
+
+    return dict(zip(out["body_part"], out["volume"]))
+
+def day_summary(rows: List[Tuple[Any, ...]], exercise_to_body_part: Dict[str, str]) -> Dict[str, Any]:
+    """
+    rows: DBから取ったエントリ行のリスト（fetch_entries系の戻り値）
+    return: { "total_volume": int, "by_body_part": [{body_part, volume}, ...] }
+    """
+    if not rows:
+        return {"total_volume": 0, "by_body_part": []}
+
+    df = rows_to_df(rows)
+    df = add_body_part(df, exercise_to_body_part)
+
+    total = volume_total(df)
+    by_part_df = volume_by_body_part(df)
+
+    return {
+        "total_volume": int(total),
+        "by_body_part": by_part_df.to_dict(orient="records"),
+    }
+
+def get_date_range_list(start_iso: str, end_iso: str) -> List[str]:
+    """開始日〜終了日（ISO文字列）の全日付リストを返す"""
+    s = date.fromisoformat(start_iso)
+    e = date.fromisoformat(end_iso)
+    days = []
+    curr = s
+    while curr <= e:
+        days.append(curr.isoformat())
+        curr += timedelta(days=1)
+    return days
